@@ -203,6 +203,25 @@ pub(crate) mod tests {
             .unwrap();
         poller.poll(&mut events, Some(Duration::ZERO)).unwrap();
         assert!(events.is_empty());
+
+        // A pipe whose writer closed must wake its reader (epoll reports only HUP here),
+        // and must stay silent while muted.
+        let (r, w) = crate::os::fd::pipe(true).unwrap();
+        poller
+            .register(r.as_raw_fd(), 10, Interest::READABLE)
+            .unwrap();
+        drop(w);
+        poller
+            .poll(&mut events, Some(Duration::from_secs(5)))
+            .unwrap();
+        assert!(events.iter().any(|e| e.key == 10 && e.readiness.readable));
+        events.clear();
+        poller
+            .reregister(r.as_raw_fd(), 10, Interest::READABLE, Interest::NONE)
+            .unwrap();
+        poller.poll(&mut events, Some(Duration::ZERO)).unwrap();
+        assert!(events.is_empty(), "muted hung-up pipe reports nothing");
+        poller.deregister(r.as_raw_fd(), Interest::NONE).unwrap();
     }
 
     #[test]
