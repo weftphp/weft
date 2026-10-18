@@ -21,16 +21,38 @@ written in Rust** that exposes this engine to PHP userland as weft's own plugin.
 
 ### Current status
 
-weft is a library crate (`src/lib.rs`) plus a placeholder binary (`src/main.rs`). Implemented so far:
+weft is a library crate (`src/lib.rs`) plus a placeholder binary (`src/main.rs`) and runnable
+examples (`examples/`). The Rust engine's layers exist; the PHP extension does not yet. Each
+module's `mod.rs` documents its contents:
 
-- `src/core/` — foundational building blocks: error type, logger, timer, read buffer
-  (`ByteBuffer`), write queue (`WriteQueue`), byte-message channels, base64, crc32. Overview in
-  `src/core/mod.rs`.
+- `src/core/` — error type, logger, timer, read buffer (`ByteBuffer`), write queue
+  (`WriteQueue`), byte-message channels, base64, crc32, sha1, OS randomness.
+- `src/os/` — fd helpers, signal self-pipe, fork/wait, supervised process pool, sendfile,
+  helper-thread pool, interval alarm, System V message queues (Linux).
+- `src/reactor/` — event loop (epoll / kqueue / poll backends) and `current` (the per-thread
+  "current reactor" used by coroutines and `global`).
+- `src/global/` — per-thread event loop behind plain functions (timers, fd watching).
+- `src/lock/`, `src/memory/` — cross-process locks and shared-memory structures.
+- `src/network/` — addresses, sockets, DNS, callback client, blocking framed client.
+- `src/protocol/` — sans-I/O codecs: framing, HTTP/1.x, HTTP/2 + HPACK, WebSocket, Redis,
+  MQTT, SOCKS5, message bus, MIME types.
+- `src/coroutine/` — stackful coroutines (hand-written context switch for aarch64 and
+  x86_64), sync primitives, coroutine sockets, HTTP/WebSocket client, system services.
+- `src/server/` — multi-worker server (process or thread mode), task workers, HTTP server.
 
-Nothing else (reactor, coroutines, networking, server, protocols) exists yet. Do not assume any
-other module, API, or architecture exists — check the code first.
+Not implemented: TLS (`ssl`/`dtls` in the reference) and an io_uring backend.
+
+Platform coverage: everything is tested on macOS (kqueue). Linux-only paths (epoll, futex
+waits, System V message queues) and the x86_64 context switch are type-checked with
+`cargo clippy --target {x86_64,aarch64}-unknown-linux-gnu` but have not been run on Linux
+yet; run the test suite on Linux before relying on them.
 
 The only dependency is `libc`, used for syscalls that `std` does not expose.
+
+Decided so far:
+
+- Async runtime: weft has its own reactor (epoll / kqueue / poll) and stackful coroutines;
+  it does not build on tokio.
 
 Open decisions (do **not** settle these unilaterally — ask the user):
 
@@ -38,7 +60,8 @@ Open decisions (do **not** settle these unilaterally — ask the user):
   are supported, and whether ZTS builds are supported.
 - Whether the PHP-facing API mirrors the reference implementation's (`go()`, server classes, …) or
   is weft's own design.
-- Async runtime strategy (custom reactor on `mio`/`io_uring` vs. building on `tokio`).
+- TLS: which library to depend on (e.g. OpenSSL bindings vs. rustls); this adds weft's
+  first non-`libc` dependency.
 - Crate/workspace layout (single crate vs. Cargo workspace split into core / net / http / etc.).
 
 ## Reference source

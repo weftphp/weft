@@ -20,6 +20,12 @@ pub enum ErrorKind {
     TooLarge,
     /// The resource was closed.
     Closed,
+    /// Nothing matched the request (an unknown host, key or path).
+    NotFound,
+    /// The operation did not finish within its time limit.
+    TimedOut,
+    /// The peer sent data that violates the protocol being spoken.
+    Protocol,
     /// An operating-system I/O error; see [`Error::io_error`].
     Io,
 }
@@ -32,6 +38,9 @@ impl ErrorKind {
             ErrorKind::Full => "full",
             ErrorKind::TooLarge => "too large",
             ErrorKind::Closed => "closed",
+            ErrorKind::NotFound => "not found",
+            ErrorKind::TimedOut => "timed out",
+            ErrorKind::Protocol => "protocol error",
             ErrorKind::Io => "I/O error",
         }
     }
