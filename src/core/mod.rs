@@ -7,6 +7,8 @@
 //! - [`timer`]: one-shot and repeating timers driven by an event loop.
 //! - [`log`]: leveled logger with file rotation.
 //! - [`base64`], [`crc32`]: encoding and checksums.
+//! - [`random`]: OS randomness for protocol nonces.
+//! - [`sha1`]: SHA-1, for protocols that require it.
 
 pub mod base64;
 pub mod buffer;
@@ -15,6 +17,8 @@ pub mod channel;
 pub mod crc32;
 pub mod error;
 pub mod log;
+pub mod random;
+pub mod sha1;
 pub mod timer;
 
 pub use error::{Error, ErrorKind, Result};
