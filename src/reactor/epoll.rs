@@ -1,5 +1,6 @@
 //! Linux backend on epoll, level-triggered.
 
+use std::collections::HashSet;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::time::Duration;
@@ -12,6 +13,9 @@ const BATCH: usize = 256;
 pub struct Epoll {
     epfd: OwnedFd,
     buffer: Vec<libc::epoll_event>,
+    /// Registrations that ask for nothing. They are kept out of the epoll set, because epoll
+    /// always reports HUP/ERR, level-triggered, and a hung-up fd would make every wait return.
+    muted: HashSet<RawFd>,
 }
 
 impl Epoll {
@@ -22,17 +26,12 @@ impl Epoll {
             // SAFETY: the descriptor was just created and is owned by nobody else.
             epfd: unsafe { OwnedFd::from_raw_fd(fd) },
             buffer: vec![libc::epoll_event { events: 0, u64: 0 }; BATCH],
+            muted: HashSet::new(),
         })
     }
 
     fn control(&self, op: libc::c_int, fd: RawFd, key: u64, interest: Interest) -> io::Result<()> {
-        // A muted registration asks for nothing, so the kernel can only report HUP/ERR for it,
-        // which `poll` then filters out.
-        let mut flags = if interest == Interest::NONE {
-            0
-        } else {
-            libc::EPOLLRDHUP
-        };
+        let mut flags = libc::EPOLLRDHUP;
         if interest.is_readable() {
             flags |= libc::EPOLLIN;
         }
@@ -54,14 +53,35 @@ impl Poller for Epoll {
     }
 
     fn register(&mut self, fd: RawFd, key: u64, interest: Interest) -> io::Result<()> {
+        if interest == Interest::NONE {
+            self.muted.insert(fd);
+            return Ok(());
+        }
         self.control(libc::EPOLL_CTL_ADD, fd, key, interest)
     }
 
     fn reregister(&mut self, fd: RawFd, key: u64, _old: Interest, new: Interest) -> io::Result<()> {
-        self.control(libc::EPOLL_CTL_MOD, fd, key, new)
+        let was_muted = self.muted.contains(&fd);
+        match (was_muted, new == Interest::NONE) {
+            (true, true) => Ok(()),
+            (true, false) => {
+                self.control(libc::EPOLL_CTL_ADD, fd, key, new)?;
+                self.muted.remove(&fd);
+                Ok(())
+            }
+            (false, true) => {
+                self.control(libc::EPOLL_CTL_DEL, fd, 0, Interest::NONE)?;
+                self.muted.insert(fd);
+                Ok(())
+            }
+            (false, false) => self.control(libc::EPOLL_CTL_MOD, fd, key, new),
+        }
     }
 
     fn deregister(&mut self, fd: RawFd, _interest: Interest) -> io::Result<()> {
+        if self.muted.remove(&fd) {
+            return Ok(());
+        }
         self.control(libc::EPOLL_CTL_DEL, fd, 0, Interest::NONE)
     }
 
@@ -85,12 +105,10 @@ impl Poller for Epoll {
         }
         for raw in &self.buffer[..n as usize] {
             let bits = raw.events as libc::c_int;
-            if bits & (libc::EPOLLIN | libc::EPOLLOUT | libc::EPOLLRDHUP) == 0 {
-                continue;
-            }
+            let key = raw.u64;
             let hangup = bits & (libc::EPOLLHUP | libc::EPOLLRDHUP) != 0;
             events.push(Event {
-                key: raw.u64,
+                key,
                 readiness: Readiness {
                     readable: bits & libc::EPOLLIN != 0 || hangup,
                     writable: bits & libc::EPOLLOUT != 0,

@@ -14,8 +14,11 @@ use crate::core::{Error, ErrorKind, Result};
 use crate::network::SocketAddress;
 use crate::protocol::http::{Limits, Method, Request, Response, ResponseParser};
 use crate::protocol::websocket::{
-    self, Assembler, CloseReason, FrameDecoder, Message, Role, close_code, encode_frame,
+    self, Assembler, CloseReason, FrameDecoder, Message, Opcode, Role, close_code, encode_frame,
 };
+
+/// How long [`WsClient::close`] waits for the server's `Close`.
+pub const CLOSE_WAIT: Duration = Duration::from_secs(5);
 
 /// A connection-reusing client for one host.
 pub struct HttpClient {
@@ -271,14 +274,32 @@ impl WsClient {
         }
     }
 
-    /// Starts the closing handshake.
+    /// Runs the closing handshake: sends a `Close`, then discards incoming messages until the
+    /// server's `Close` arrives, the server closes the connection, or [`CLOSE_WAIT`] passes.
+    ///
+    /// Waiting lets the server close TCP first (RFC 6455 §7.1.1). Dropping the socket with
+    /// unread data instead makes the kernel reset the connection, which the server then sees
+    /// as an error rather than a clean close.
     pub fn close(&mut self, code: u16, reason: &str) -> Result<()> {
         self.send(Message::Close(Some(CloseReason {
             code,
             reason: reason.to_owned(),
         })))?;
         self.closed = true;
-        Ok(())
+        self.socket.read_timeout = Some(CLOSE_WAIT);
+        loop {
+            // The handshake is best effort: any decode or read failure ends it.
+            match self.decoder.decode_frame(&mut self.buffer) {
+                Ok(Some(frame)) if frame.opcode == Opcode::Close => return Ok(()),
+                Ok(Some(_)) => continue,
+                Ok(None) => {}
+                Err(_) => return Ok(()),
+            }
+            match self.socket.recv_into(&mut self.buffer, 64 * 1024) {
+                Ok(n) if n > 0 => {}
+                _ => return Ok(()),
+            }
+        }
     }
 }
 

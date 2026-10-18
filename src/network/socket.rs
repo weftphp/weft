@@ -69,9 +69,13 @@ impl Socket {
 
     /// Creates a connected pair of Unix-domain sockets.
     pub fn pair(kind: SocketType) -> io::Result<(Socket, Socket)> {
+        #[cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd"))]
+        let ty = kind.raw() | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC;
+        #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "freebsd")))]
+        let ty = kind.raw();
         let mut fds = [0; 2];
         // SAFETY: `fds` has room for the two descriptors socketpair writes.
-        check(unsafe { libc::socketpair(libc::AF_UNIX, kind.raw(), 0, fds.as_mut_ptr()) })?;
+        check(unsafe { libc::socketpair(libc::AF_UNIX, ty, 0, fds.as_mut_ptr()) })?;
         // SAFETY: socketpair succeeded, so both descriptors are open and unowned.
         let (a, b) = unsafe {
             (
