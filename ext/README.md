@@ -72,3 +72,12 @@ run(function () {
   the whole process; use the `Weft\` equivalents.
 - A PHP fatal error inside a coroutine ends the process, as usual for PHP.
 - ZTS builds and PHP versions before 8.4 are not supported.
+
+## Editor support
+
+The extension has no PHP source for editors to read, so they report `Weft\…` calls as unknown.
+The declaration-only stubs live in the separate `weft-ide-helper` package (`../weft-ide-helper`):
+
+```sh
+composer require --dev weft/ide-helper
+```
