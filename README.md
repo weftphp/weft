@@ -1,17 +1,17 @@
 # weft
 
-An asynchronous, coroutine-based engine for PHP, written in Rust.
+An asynchronous, coroutine-based engine for PHP.
 
 weft brings an event loop, coroutines, timers, and multi-process TCP/UDP/HTTP/WebSocket servers
-to PHP. The goal is a **standalone PHP extension**: PHP code gets coroutine-based concurrency, while
-the engine underneath is written in memory-safe Rust.
+to PHP. The goal is a **standalone PHP extension**: PHP code gets coroutine-based concurrency, backed
+by a fast, memory-safe native engine.
 
-> **Status: early development.** The Rust engine is in place; the PHP extension does not exist
+> **Status: early development.** The engine is in place; the PHP extension does not exist
 > yet. APIs will change.
 
 ## Roadmap
 
-1. **Rust engine:** build the engine's layers in idiomatic Rust.
+1. **Engine:** build the engine's layers.
    - [x] `core`: errors, logging, timers, buffers, channels, encodings
    - [x] `reactor`: event loop on epoll / kqueue / poll
    - [x] `coroutine`: stackful coroutines, scheduler, coroutine sockets and clients
@@ -40,65 +40,16 @@ The only dependency is `libc`.
 
 ## Examples
 
-A coroutine TCP echo server ([examples/echo.rs](examples/echo.rs)):
+Runnable examples live in [examples/](examples/):
 
-```rust
-use weft::coroutine::{self, CoSocket};
-
-coroutine::run(|| {
-    let listener = CoSocket::listen(&"127.0.0.1:9501".parse().unwrap(), 128).unwrap();
-    while let Ok((conn, _peer)) = listener.accept(None) {
-        coroutine::spawn(move || {
-            let mut buf = [0u8; 4096];
-            while let Ok(n) = conn.recv(&mut buf) {
-                if n == 0 || conn.send_all(&buf[..n]).is_err() {
-                    break;
-                }
-            }
-        })
-        .unwrap();
-    }
-})?;
-```
-
-An HTTP server with four supervised worker processes ([examples/http.rs](examples/http.rs)),
-answering HTTP/1.1 and HTTP/2:
-
-```rust
-use weft::protocol::http::{Request, Response};
-use weft::server::http::{self, HttpApp, HttpContext, HttpOptions, RequestId};
-use weft::server::{Config, Listener};
-
-struct Hello;
-
-impl HttpApp for Hello {
-    fn on_request(&mut self, _ctx: &mut HttpContext<'_, '_>, _id: RequestId, req: Request) -> Option<Response> {
-        Some(Response::new(200).with_body(format!("hello {}\n", req.path())))
-    }
-}
-
-let config = Config {
-    listeners: vec![Listener::stream("127.0.0.1:9502".parse()?)],
-    workers: 4,
-    ..Config::default()
-};
-http::server(config, HttpOptions::default(), |_| Hello)?.run()?;
-```
-
-```sh
-cargo run --example echo     # then: nc 127.0.0.1 9501
-cargo run --example http     # then: curl http://127.0.0.1:9502/hello
-```
+- `echo`: a coroutine TCP echo server on port 9501 (try it with `nc 127.0.0.1 9501`).
+- `http`: an HTTP server with four supervised worker processes, answering HTTP/1.1 and HTTP/2 on
+  port 9502 (try it with `curl http://127.0.0.1:9502/hello`).
 
 ## Building
 
-Requires stable Rust (edition 2024) and OpenSSL 3.0 or newer. Linux is the primary target.
-
-```sh
-cargo build
-cargo test
-cargo clippy --all-targets -- -D warnings
-```
+Requires OpenSSL 3.0 or newer. Linux is the primary target. See [AGENTS.md](AGENTS.md) for the
+build, test and lint commands.
 
 ## Contributing
 
