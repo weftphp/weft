@@ -4,6 +4,9 @@
 //! Reactor callbacks only update state and queue [`Event`]s; [`pump`] then feeds the events
 //! to the handler one at a time. Handler actions that would produce further events (such as
 //! closing a connection) queue them too, so the handler is never re-entered.
+//!
+//! On TLS listeners a connection is announced (`on_connect`) only once its handshake has
+//! finished; one that fails the handshake disappears without `on_close`.
 
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
@@ -23,6 +26,7 @@ use crate::core::bytes::ByteBuffer;
 use crate::core::timer::TimerId;
 use crate::core::{Error, ErrorKind, Result};
 use crate::memory::queue::SharedQueue;
+use crate::network::tls::TlsSession;
 use crate::network::{Socket, SocketAddress};
 use crate::reactor::{Interest, Reactor, Readiness, Token};
 
@@ -35,6 +39,8 @@ pub(crate) struct ListenerSlot {
 }
 
 struct Conn {
+    // Declared before `socket` so it is dropped first: it does I/O on the socket's descriptor.
+    tls: Option<Box<TlsSession>>,
     socket: Socket,
     token: Token,
     port: usize,
@@ -51,6 +57,9 @@ struct Conn {
     paused: bool,
     bytes_in: u64,
     bytes_out: u64,
+    /// `on_connect` was delivered, so `on_close` is owed. TLS connections are announced
+    /// after the handshake.
+    announced: bool,
 }
 
 type TimerFn = Box<dyn FnOnce(&mut Context<'_>)>;
@@ -159,6 +168,16 @@ impl Core {
             if listener.nodelay && peer.as_inet().is_some() {
                 let _ = socket.set_nodelay(true);
             }
+            let tls = match &listener.tls {
+                // SAFETY: the session goes into the same `Conn` as the socket, in a field
+                // declared (and so dropped) before it.
+                Some(tls) => match unsafe { TlsSession::server(tls, &socket) } {
+                    Ok(session) => Some(Box::new(session)),
+                    Err(_) => continue,
+                },
+                None => None,
+            };
+            let announced = tls.is_none();
             let id = self.new_conn_id();
             let fd = socket.as_raw_fd();
             let token = match r.add(fd, Interest::READABLE, move |r, _, readiness| {
@@ -171,6 +190,7 @@ impl Core {
             self.conns.insert(
                 id,
                 Conn {
+                    tls,
                     socket,
                     token,
                     port,
@@ -185,9 +205,12 @@ impl Core {
                     paused: false,
                     bytes_in: 0,
                     bytes_out: 0,
+                    announced,
                 },
             );
-            self.events.push_back(Event::Connect(id));
+            if announced {
+                self.events.push_back(Event::Connect(id));
+            }
         }
     }
 
@@ -206,6 +229,34 @@ impl Core {
     }
 
     fn on_conn_ready(&mut self, r: &mut Reactor, id: ConnId, readiness: Readiness) {
+        let Some(conn) = self.conns.get_mut(&id) else {
+            return;
+        };
+        if let Some(tls) = &mut conn.tls {
+            if !conn.announced {
+                match tls.handshake() {
+                    Ok(()) => {
+                        conn.announced = true;
+                        conn.last_active = Instant::now();
+                        self.events.push_back(Event::Connect(id));
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        self.set_interest(r, id);
+                        return;
+                    }
+                    Err(_) => {
+                        self.close_now(r, id);
+                        return;
+                    }
+                }
+            }
+            // Either readiness can unblock either direction: a TLS read may have to send
+            // and a write may have to receive.
+            self.flush(r, id);
+            self.read(r, id);
+            self.set_interest(r, id);
+            return;
+        }
         if readiness.writable {
             self.flush(r, id);
         }
@@ -222,8 +273,13 @@ impl Core {
         if conn.paused || conn.closing {
             return;
         }
-        let socket = &conn.socket;
-        let result = conn.input.fill_with(chunk, |space| socket.recv(space));
+        let result = match &mut conn.tls {
+            Some(tls) => read_tls(tls, &mut conn.input, chunk),
+            None => {
+                let socket = &conn.socket;
+                conn.input.fill_with(chunk, |space| socket.recv(space))
+            }
+        };
         match result {
             Ok(0) => {
                 // Deliver anything still decodable, then close.
@@ -274,11 +330,25 @@ impl Core {
             return;
         };
         let mut want = Interest::NONE;
-        if !conn.paused && !conn.closing {
-            want = want | Interest::READABLE;
-        }
-        if !conn.output.is_empty() {
-            want = want | Interest::WRITABLE;
+        match &conn.tls {
+            Some(tls) if !conn.announced => want = tls.wants(),
+            tls => {
+                if !conn.paused && !conn.closing {
+                    want = want | Interest::READABLE;
+                }
+                if !conn.output.is_empty() {
+                    want = want | Interest::WRITABLE;
+                }
+                // A TLS read that has to send, or a write that has to receive.
+                if let Some(tls) = tls {
+                    if want.is_readable() && tls.wants() == Interest::WRITABLE {
+                        want = want | Interest::WRITABLE;
+                    }
+                    if !conn.output.is_empty() && tls.wants() == Interest::READABLE {
+                        want = want | Interest::READABLE;
+                    }
+                }
+            }
         }
         if want != conn.interest && r.set_interest(conn.token, want).is_ok() {
             conn.interest = want;
@@ -295,20 +365,30 @@ impl Core {
                 None => break,
                 Some(Segment::Bytes { .. }) => {
                     let slices = conn.output.io_slices(64);
-                    conn.socket.send_vectored(&slices).map(Some)
+                    match &mut conn.tls {
+                        Some(tls) => tls.write_vectored(&slices),
+                        None => conn.socket.send_vectored(&slices),
+                    }
+                    .map(Some)
                 }
                 Some(Segment::File {
                     file,
                     offset,
                     remaining,
-                }) => crate::os::sendfile::send_file(
-                    conn.socket.as_fd(),
-                    file,
-                    *offset,
-                    (*remaining).min(usize::MAX as u64) as usize,
-                )
-                .map(Some),
+                }) => {
+                    let len = (*remaining).min(usize::MAX as u64) as usize;
+                    match &mut conn.tls {
+                        Some(tls) => tls.send_file(file, *offset, len),
+                        None => {
+                            crate::os::sendfile::send_file(conn.socket.as_fd(), file, *offset, len)
+                        }
+                    }
+                    .map(Some)
+                }
                 Some(Segment::Shutdown) => {
+                    if let Some(tls) = &mut conn.tls {
+                        tls.close_notify();
+                    }
                     let _ = conn.socket.shutdown(Shutdown::Write);
                     conn.output.pop_front();
                     Ok(None)
@@ -339,10 +419,15 @@ impl Core {
     }
 
     fn close_now(&mut self, r: &mut Reactor, id: ConnId) {
-        if let Some(conn) = self.conns.remove(&id) {
+        if let Some(mut conn) = self.conns.remove(&id) {
+            if let Some(tls) = &mut conn.tls {
+                tls.close_notify();
+            }
             self.by_token.remove(&conn.token);
             let _ = r.remove(conn.token);
-            self.events.push_back(Event::Close(id));
+            if conn.announced {
+                self.events.push_back(Event::Close(id));
+            }
         }
     }
 
@@ -432,6 +517,27 @@ impl Core {
             .collect();
         for id in stale {
             self.close_now(r, id);
+        }
+    }
+}
+
+/// Reads at least up to `budget` bytes through TLS into `input`, then keeps going while
+/// OpenSSL still holds decrypted bytes: the kernel no longer reports those as readable, so
+/// the level-triggered loop would never come back for them. `Ok(0)` means the peer closed.
+fn read_tls(tls: &mut TlsSession, input: &mut ByteBuffer, budget: usize) -> io::Result<usize> {
+    let mut total = 0;
+    loop {
+        // One read returns at most one record's worth of plaintext.
+        match input.fill_with(16 * 1024, |space| tls.read(space)) {
+            Ok(0) => return Ok(total),
+            Ok(n) => {
+                total += n;
+                if total >= budget && tls.buffered() == 0 {
+                    return Ok(total);
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock && total > 0 => return Ok(total),
+            Err(e) => return Err(e),
         }
     }
 }
@@ -583,7 +689,8 @@ impl<'a> Context<'a> {
 
     /// Details of a connection owned by this worker.
     pub fn info(&self, conn: ConnId) -> Option<ConnInfo> {
-        self.core.conns.get(&conn).map(|c| ConnInfo {
+        let c = self.core.conns.get(&conn).filter(|c| c.announced)?;
+        Some(ConnInfo {
             id: conn,
             port: c.port,
             peer: c.peer.clone(),
@@ -592,12 +699,18 @@ impl<'a> Context<'a> {
             bytes_in: c.bytes_in,
             bytes_out: c.bytes_out,
             pending_output: c.output.pending(),
+            tls: c.tls.as_ref().and_then(|t| t.info()),
         })
     }
 
-    /// Connections owned by this worker.
+    /// Connections owned by this worker (excluding TLS ones still in their handshake).
     pub fn connections(&self) -> Vec<ConnId> {
-        self.core.conns.keys().copied().collect()
+        self.core
+            .conns
+            .iter()
+            .filter(|(_, c)| c.announced)
+            .map(|(id, _)| *id)
+            .collect()
     }
 
     /// Sends a datagram from datagram listener `port`.

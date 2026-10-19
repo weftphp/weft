@@ -10,6 +10,8 @@
 //! Workers can message each other ([`Context::send_message`]) and send to or close
 //! connections owned by other workers.
 //!
+//! Stream listeners can serve TLS ([`Listener::with_tls`]); handlers then see plaintext.
+//!
 //! In process mode the main process supervises the workers: it restarts crashed ones,
 //! replaces them all one by one on `SIGUSR1`, and shuts down on `SIGTERM`/`SIGINT`.
 
@@ -79,6 +81,8 @@ pub struct ConnInfo {
     pub bytes_in: u64,
     pub bytes_out: u64,
     pub pending_output: u64,
+    /// What the TLS handshake negotiated, for connections on TLS listeners.
+    pub tls: Option<crate::network::TlsInfo>,
 }
 
 /// Which kind of worker a handler instance serves.

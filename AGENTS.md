@@ -33,26 +33,32 @@ module's `mod.rs` documents its contents:
   "current reactor" used by coroutines and `global`).
 - `src/global/` — per-thread event loop behind plain functions (timers, fd watching).
 - `src/lock/`, `src/memory/` — cross-process locks and shared-memory structures.
-- `src/network/` — addresses, sockets, DNS, callback client, blocking framed client.
+- `src/network/` — addresses, sockets, DNS, callback client (optionally TLS), blocking
+  framed client, TLS contexts and sessions (`tls`).
 - `src/protocol/` — sans-I/O codecs: framing, HTTP/1.x, HTTP/2 + HPACK, WebSocket, Redis,
   MQTT, SOCKS5, message bus, MIME types.
 - `src/coroutine/` — stackful coroutines (hand-written context switch for aarch64 and
-  x86_64), sync primitives, coroutine sockets, HTTP/WebSocket client, system services.
+  x86_64), sync primitives, coroutine sockets (optionally TLS), HTTP/WebSocket client
+  (`http`/`https`, `ws`/`wss`), system services.
 - `src/server/` — multi-worker server (process or thread mode), task workers, HTTP server.
+  Stream listeners can serve TLS; the HTTP server does HTTP/2 over TLS through ALPN.
 
-Not implemented: TLS (`ssl`/`dtls` in the reference) and an io_uring backend.
+Not implemented: DTLS, TLS in the blocking framed client (`network::stream`), kernel TLS
+offload (TLS file responses are copied, not `sendfile`d), and an io_uring backend.
 
-Platform coverage: everything is tested on macOS (kqueue). Linux-only paths (epoll, futex
-waits, System V message queues) and the x86_64 context switch are type-checked with
-`cargo clippy --target {x86_64,aarch64}-unknown-linux-gnu` but have not been run on Linux
-yet; run the test suite on Linux before relying on them.
+Platform coverage: the full suite must pass on macOS (kqueue) and on Linux (epoll, futex
+waits, System V message queues), on both x86_64 and aarch64 (the two context switches), in
+debug and release builds. Linux was last verified in `rust:1` containers (see Commands).
 
-The only dependency is `libc`, used for syscalls that `std` does not expose.
+Dependencies: `libc`, for syscalls that `std` does not expose, and `openssl`, for TLS. weft
+needs OpenSSL **3.0 or newer** (it relies on `SSL_OP_IGNORE_UNEXPECTED_EOF`); the
+`openssl` crate finds it through `pkg-config` or `OPENSSL_DIR`.
 
 Decided so far:
 
 - Async runtime: weft has its own reactor (epoll / kqueue / poll) and stackful coroutines;
   it does not build on tokio.
+- TLS: OpenSSL, through the `openssl` crate (not rustls).
 
 Open decisions (do **not** settle these unilaterally — ask the user):
 
@@ -60,8 +66,6 @@ Open decisions (do **not** settle these unilaterally — ask the user):
   are supported, and whether ZTS builds are supported.
 - Whether the PHP-facing API mirrors the reference implementation's (`go()`, server classes, …) or
   is weft's own design.
-- TLS: which library to depend on (e.g. OpenSSL bindings vs. rustls); this adds weft's
-  first non-`libc` dependency.
 - Crate/workspace layout (single crate vs. Cargo workspace split into core / net / http / etc.).
 
 ## Reference source
@@ -88,9 +92,9 @@ Rules:
 
 ## Toolchain
 
-- Rust **edition 2024** (see `Cargo.toml`); developed with stable rustc 1.98.
-- Primary dev platform: macOS (darwin). The engine targets Linux first — keep Linux-specific code
-  (epoll, io_uring, signalfd, etc.) behind `cfg(target_os = ...)` and keep macOS (kqueue) building.
+- Rust **edition 2024** (see `Cargo.toml`), on stable.
+- The engine targets Linux first — keep Linux-specific code (epoll, io_uring, signalfd, etc.)
+  behind `cfg(target_os = ...)` and keep the BSD/macOS (kqueue) backend building.
 
 ## Commands
 
@@ -102,8 +106,26 @@ cargo fmt --all                               # format
 cargo clippy --all-targets -- -D warnings     # lint (treat warnings as errors)
 ```
 
+Running the suite on Linux from another OS, in a container (use `--platform linux/amd64`
+for x86_64; a separate `CARGO_TARGET_DIR` keeps it from clobbering the host's `target/`):
+
+```sh
+docker run --rm -v "$PWD":/work -w /work -e CARGO_TARGET_DIR=/tmp/target rust:1 \
+  sh -c 'rustup component add clippy && cargo clippy --all-targets -- -D warnings && cargo test'
+```
+
+Type-checking a Linux target from another OS needs that target installed
+(`rustup target add x86_64-unknown-linux-gnu`) and OpenSSL headers for `openssl-sys`
+(`OPENSSL_DIR`). Nothing is linked, so the host's headers are fine:
+
+```sh
+OPENSSL_DIR=/path/to/openssl \
+  CC_x86_64_unknown_linux_gnu=clang CC_aarch64_unknown_linux_gnu=clang \
+  cargo clippy --all-targets --target x86_64-unknown-linux-gnu -- -D warnings
+```
+
 Before considering a change done, run `cargo fmt --all`, `cargo clippy --all-targets -- -D warnings`,
-and `cargo test`, and make sure all three pass.
+and `cargo test`, and make sure all three pass on macOS and on Linux.
 
 ## Coding conventions
 

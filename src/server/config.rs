@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use crate::core::Result;
 use crate::network::SocketAddress;
+use crate::network::tls::ServerTls;
 use crate::protocol::framing::{Decoder, Delimited, LengthPrefixed};
 
 /// A boxed message decoder, one per connection.
@@ -65,6 +66,9 @@ pub struct Listener {
     pub backlog: i32,
     /// Disable Nagle's algorithm on accepted TCP connections.
     pub nodelay: bool,
+    /// Serve TLS on this (stream) listener. Handlers see decrypted data, and `on_connect`
+    /// fires once the handshake has finished.
+    pub tls: Option<ServerTls>,
 }
 
 impl Listener {
@@ -76,6 +80,7 @@ impl Listener {
             framing: Framing::Raw,
             backlog: 512,
             nodelay: true,
+            tls: None,
         }
     }
 
@@ -89,6 +94,11 @@ impl Listener {
 
     pub fn with_framing(mut self, framing: Framing) -> Listener {
         self.framing = framing;
+        self
+    }
+
+    pub fn with_tls(mut self, tls: ServerTls) -> Listener {
+        self.tls = Some(tls);
         self
     }
 }
@@ -166,6 +176,16 @@ impl Config {
             return Err(Error::new(
                 ErrorKind::InvalidArgument,
                 "workers must be at least 1",
+            ));
+        }
+        if self
+            .listeners
+            .iter()
+            .any(|l| l.tls.is_some() && l.transport == Transport::Datagram)
+        {
+            return Err(Error::new(
+                ErrorKind::InvalidArgument,
+                "TLS is only available on stream listeners",
             ));
         }
         if self.read_chunk == 0 || self.max_output == 0 {

@@ -1,8 +1,9 @@
-//! HTTP/1.1 and WebSocket clients for coroutines (cleartext only).
+//! HTTP/1.1 and WebSocket clients for coroutines, in cleartext or over TLS.
 //!
 //! An [`HttpClient`] keeps one connection to a host and reuses it while the server allows;
 //! a request on a reused connection that the server had already closed is retried once on a
-//! fresh connection. [`HttpClient::websocket`] upgrades to a [`WsClient`].
+//! fresh connection. [`HttpClient::websocket`] upgrades to a [`WsClient`]. A client given a
+//! [`ClientTls`] with [`HttpClient::with_tls`] speaks HTTPS (and WebSocket over TLS).
 
 use std::net::IpAddr;
 use std::time::Duration;
@@ -12,6 +13,7 @@ use super::system;
 use crate::core::bytes::ByteBuffer;
 use crate::core::{Error, ErrorKind, Result};
 use crate::network::SocketAddress;
+use crate::network::tls::ClientTls;
 use crate::protocol::http::{Limits, Method, Request, Response, ResponseParser};
 use crate::protocol::websocket::{
     self, Assembler, CloseReason, FrameDecoder, Message, Opcode, Role, close_code, encode_frame,
@@ -28,18 +30,34 @@ pub struct HttpClient {
     pub limits: Limits,
     /// Extra headers added to every request (unless the request sets them).
     pub default_headers: Vec<(String, String)>,
+    tls: Option<ClientTls>,
     conn: Option<(CoSocket, ByteBuffer)>,
 }
 
-/// Splits `http://host[:port]/path` into its parts.
-pub fn parse_url(url: &str) -> Result<(String, u16, String)> {
+/// The parts of an `http://` or `https://` URL.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Url {
+    /// `https`.
+    pub secure: bool,
+    pub host: String,
+    pub port: u16,
+    /// Path and query, starting with `/`.
+    pub path: String,
+}
+
+/// Splits `http[s]://host[:port]/path` into its parts.
+pub fn parse_url(url: &str) -> Result<Url> {
     let bad = || {
         Error::new(
             ErrorKind::InvalidArgument,
             format!("unsupported URL {url:?}"),
         )
     };
-    let rest = url.strip_prefix("http://").ok_or_else(bad)?;
+    let (secure, rest) = match url.split_once("://") {
+        Some(("http", rest)) => (false, rest),
+        Some(("https", rest)) => (true, rest),
+        _ => return Err(bad()),
+    };
     let (authority, path) = match rest.find('/') {
         Some(i) => (&rest[..i], &rest[i..]),
         None => (rest, "/"),
@@ -61,14 +79,23 @@ pub fn parse_url(url: &str) -> Result<(String, u16, String)> {
     if host.is_empty() {
         return Err(bad());
     }
-    Ok((host.to_owned(), port.unwrap_or(80), path.to_owned()))
+    Ok(Url {
+        secure,
+        host: host.to_owned(),
+        port: port.unwrap_or(if secure { 443 } else { 80 }),
+        path: path.to_owned(),
+    })
 }
 
-/// One-shot GET of an `http://` URL.
+/// One-shot GET of an `http://` or `https://` URL. HTTPS verifies the server against
+/// OpenSSL's default trust store.
 pub fn get(url: &str) -> Result<Response> {
-    let (host, port, path) = parse_url(url)?;
-    let mut client = HttpClient::new(&host, port);
-    client.request(Request::new(Method::Get, path))
+    let url = parse_url(url)?;
+    let mut client = HttpClient::new(&url.host, url.port);
+    if url.secure {
+        client = client.with_tls(ClientTls::new()?);
+    }
+    client.request(Request::new(Method::Get, url.path))
 }
 
 impl HttpClient {
@@ -79,8 +106,18 @@ impl HttpClient {
             timeout: Duration::from_secs(30),
             limits: Limits::default(),
             default_headers: vec![("User-Agent".into(), "weft".into())],
+            tls: None,
             conn: None,
         }
+    }
+
+    /// Speaks HTTPS: connections run TLS with `tls`, verifying the server as this client's
+    /// host. The client speaks HTTP/1.1 only, so `tls` must not offer other protocols
+    /// through ALPN.
+    pub fn with_tls(mut self, tls: ClientTls) -> HttpClient {
+        self.tls = Some(tls);
+        self.conn = None;
+        self
     }
 
     fn address(&self) -> Result<SocketAddress> {
@@ -97,6 +134,19 @@ impl HttpClient {
 
     fn connect(&mut self) -> Result<()> {
         let mut socket = CoSocket::connect(&self.address()?, Some(self.timeout))?;
+        if let Some(tls) = &self.tls {
+            socket.start_tls_client(tls, &self.host, Some(self.timeout))?;
+            let alpn = socket.tls_info().and_then(|info| info.alpn);
+            if let Some(protocol) = alpn.filter(|p| p != b"http/1.1") {
+                return Err(Error::new(
+                    ErrorKind::Protocol,
+                    format!(
+                        "server chose {:?} through ALPN; this client speaks HTTP/1.1",
+                        String::from_utf8_lossy(&protocol)
+                    ),
+                ));
+            }
+        }
         socket.read_timeout = Some(self.timeout);
         socket.write_timeout = Some(self.timeout);
         self.conn = Some((socket, ByteBuffer::new()));
@@ -104,7 +154,8 @@ impl HttpClient {
     }
 
     fn host_header(&self) -> String {
-        if self.port == 80 {
+        let default_port = if self.tls.is_some() { 443 } else { 80 };
+        if self.port == default_port {
             self.host.clone()
         } else if self.host.contains(':') {
             format!("[{}]:{}", self.host, self.port)
@@ -307,30 +358,49 @@ impl WsClient {
 mod tests {
     use super::super::runtime::{run, spawn};
     use super::*;
+    use crate::network::tls::{ServerTls, test_pki};
     use crate::protocol::http::RequestParser;
 
     #[test]
     fn urls() {
+        let url = |secure, host: &str, port, path: &str| Url {
+            secure,
+            host: host.into(),
+            port,
+            path: path.into(),
+        };
         assert_eq!(
             parse_url("http://example.test:8080/a?b").unwrap(),
-            ("example.test".into(), 8080, "/a?b".into())
+            url(false, "example.test", 8080, "/a?b")
         );
-        assert_eq!(parse_url("http://h").unwrap(), ("h".into(), 80, "/".into()));
+        assert_eq!(parse_url("http://h").unwrap(), url(false, "h", 80, "/"));
         assert_eq!(
             parse_url("http://[::1]:9/x").unwrap(),
-            ("::1".into(), 9, "/x".into())
+            url(false, "::1", 9, "/x")
         );
-        assert!(parse_url("https://secure.test/").is_err());
+        assert_eq!(
+            parse_url("https://secure.test/").unwrap(),
+            url(true, "secure.test", 443, "/")
+        );
+        assert!(parse_url("ftp://files.test/").is_err());
         assert!(parse_url("http://:80/").is_err());
     }
 
     /// A tiny coroutine HTTP server: keep-alive, closes after `/bye`, upgrades `/ws`.
-    fn serve(listener: CoSocket) {
+    fn serve(listener: CoSocket, tls: Option<ServerTls>) {
         loop {
-            let Ok((conn, _)) = listener.accept(Some(Duration::from_secs(5))) else {
+            let Ok((mut conn, _)) = listener.accept(Some(Duration::from_secs(5))) else {
                 return;
             };
+            let tls = tls.clone();
             spawn(move || {
+                if let Some(tls) = &tls
+                    && conn
+                        .start_tls_server(tls, Some(Duration::from_secs(5)))
+                        .is_err()
+                {
+                    return;
+                }
                 let mut parser = RequestParser::new(Limits::default());
                 let mut buf = ByteBuffer::new();
                 loop {
@@ -394,7 +464,7 @@ mod tests {
         run(|| {
             let listener = CoSocket::listen(&"127.0.0.1:0".parse().unwrap(), 16).unwrap();
             let port = listener.local_address().unwrap().as_inet().unwrap().port();
-            let server = spawn(move || serve(listener)).unwrap();
+            let server = spawn(move || serve(listener, None)).unwrap();
 
             let mut client = HttpClient::new("127.0.0.1", port);
             let first = client.get("/a").unwrap();
@@ -423,6 +493,66 @@ mod tests {
             ws.close(close_code::NORMAL, "done").unwrap();
             assert!(ws.send(Message::Text("late".into())).is_err());
             // Stop accepting so the loop can finish.
+            super::super::runtime::with_reactor(|r| super::super::runtime::cancel(r, server))
+                .unwrap();
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn https_and_wss() {
+        let pki = test_pki::generate();
+        let server_tls = test_pki::server_options(&pki)
+            .with_alpn(["http/1.1"])
+            .build()
+            .unwrap();
+        let client_tls = test_pki::client_options(&pki).build().unwrap();
+        let h2_only = test_pki::client_options(&pki)
+            .with_alpn(["h2"])
+            .build()
+            .unwrap();
+        let h2_server = test_pki::server_options(&pki)
+            .with_alpn(["h2"])
+            .build()
+            .unwrap();
+        run(move || {
+            let listener = CoSocket::listen(&"127.0.0.1:0".parse().unwrap(), 16).unwrap();
+            let port = listener.local_address().unwrap().as_inet().unwrap().port();
+            let server = spawn(move || serve(listener, Some(server_tls))).unwrap();
+
+            let mut client = HttpClient::new("127.0.0.1", port).with_tls(client_tls.clone());
+            let first = client.get("/a").unwrap();
+            assert_eq!(first.body, format!("GET /a 127.0.0.1:{port}").into_bytes());
+            assert_eq!(client.get("/bye").unwrap().status, 200);
+            assert_eq!(client.get("/again").unwrap().status, 200);
+
+            let mut ws = HttpClient::new("127.0.0.1", port)
+                .with_tls(client_tls.clone())
+                .websocket("/ws")
+                .unwrap();
+            ws.send(Message::Text("secure".into())).unwrap();
+            assert_eq!(
+                ws.recv(Some(Duration::from_secs(5))).unwrap(),
+                Message::Text("SECURE".into())
+            );
+            ws.close(close_code::NORMAL, "done").unwrap();
+
+            // Cleartext against a TLS port fails rather than hanging.
+            let mut plain = HttpClient::new("127.0.0.1", port);
+            plain.timeout = Duration::from_secs(5);
+            assert!(plain.get("/a").is_err());
+            super::super::runtime::with_reactor(|r| super::super::runtime::cancel(r, server))
+                .unwrap();
+
+            // A server that picks h2 is refused by this HTTP/1.1 client.
+            let listener = CoSocket::listen(&"127.0.0.1:0".parse().unwrap(), 16).unwrap();
+            let port = listener.local_address().unwrap().as_inet().unwrap().port();
+            let server = spawn(move || serve(listener, Some(h2_server))).unwrap();
+            let err = HttpClient::new("127.0.0.1", port)
+                .with_tls(h2_only)
+                .get("/")
+                .unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::Protocol);
             super::super::runtime::with_reactor(|r| super::super::runtime::cancel(r, server))
                 .unwrap();
         })

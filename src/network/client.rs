@@ -2,6 +2,9 @@
 //! outgoing data, and reports everything through [`ClientHandler`] callbacks on a
 //! [`Reactor`].
 //!
+//! With [`ClientOptions::tls`] set, the client runs a TLS handshake after connecting and
+//! reports `on_connect` only once it has finished; handlers see plaintext throughout.
+//!
 //! For sequential code, coroutine sockets ([`crate::coroutine::CoSocket`]) are usually more
 //! convenient; this client suits callback-style code and embedding layers.
 
@@ -11,6 +14,7 @@ use std::os::fd::AsRawFd;
 use std::rc::Rc;
 use std::time::Duration;
 
+use super::tls::{ClientTls, TlsInfo, TlsSession};
 use super::{Socket, SocketAddress, SocketType};
 use crate::core::buffer::{Segment, WriteQueue};
 use crate::core::bytes::ByteBuffer;
@@ -34,11 +38,17 @@ pub trait ClientHandler: 'static {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Phase {
     Connecting,
+    /// TCP is up; the TLS handshake is running.
+    Handshaking,
     Connected,
     Closed,
 }
 
 struct State {
+    // Declared before `socket` so it is dropped first: it does I/O on the socket's descriptor.
+    tls: Option<TlsSession>,
+    /// Context and server name for the session to start once TCP connects.
+    tls_pending: Option<(ClientTls, String)>,
     socket: Socket,
     token: Option<Token>,
     phase: Phase,
@@ -60,6 +70,10 @@ enum Note {
 }
 
 /// A handle to the client; clones refer to the same connection.
+///
+/// The reactor owns the connection while it is open, so it keeps running (and calling its
+/// handler) after every handle is dropped, until either side closes it. Keep a handle only
+/// to send or close from outside the handler's callbacks.
 #[derive(Clone)]
 pub struct Client {
     state: Rc<RefCell<State>>,
@@ -72,6 +86,11 @@ pub struct ClientOptions {
     pub decoder: Option<Box<dyn Decoder<Item = Vec<u8>>>>,
     /// Pending output beyond which `send` fails with `Full`.
     pub max_output: usize,
+    /// Run TLS over the connection. `connect_timeout` then covers the handshake too.
+    pub tls: Option<ClientTls>,
+    /// The host the server's certificate must name, also sent through SNI. Defaults to the
+    /// IP address connected to; required for TLS over Unix sockets.
+    pub server_name: Option<String>,
 }
 
 impl Default for ClientOptions {
@@ -80,7 +99,18 @@ impl Default for ClientOptions {
             connect_timeout: Some(Duration::from_secs(10)),
             decoder: None,
             max_output: 8 * 1024 * 1024,
+            tls: None,
+            server_name: None,
         }
+    }
+}
+
+/// TLS failures read as protocol errors; everything else keeps its I/O detail.
+fn io_failure(e: io::Error) -> Error {
+    if e.kind() == io::ErrorKind::InvalidData {
+        Error::new(ErrorKind::Protocol, e.to_string())
+    } else {
+        e.into()
     }
 }
 
@@ -92,6 +122,22 @@ impl Client {
         options: ClientOptions,
         handler: impl ClientHandler,
     ) -> Result<Client> {
+        let tls_pending = match options.tls {
+            None => None,
+            Some(tls) => {
+                let name = match (options.server_name, addr.as_inet()) {
+                    (Some(name), _) => name,
+                    (None, Some(inet)) => inet.ip().to_string(),
+                    (None, None) => {
+                        return Err(Error::new(
+                            ErrorKind::InvalidArgument,
+                            "TLS over a Unix socket needs a server_name",
+                        ));
+                    }
+                };
+                Some((tls, name))
+            }
+        };
         let socket = Socket::for_address(addr, SocketType::Stream)?;
         if addr.as_inet().is_some() {
             let _ = socket.set_nodelay(true);
@@ -99,6 +145,8 @@ impl Client {
         let connected = socket.connect(addr)?;
         let client = Client {
             state: Rc::new(RefCell::new(State {
+                tls: None,
+                tls_pending,
                 socket,
                 token: None,
                 phase: Phase::Connecting,
@@ -114,11 +162,16 @@ impl Client {
             })),
         };
         let fd = client.state.borrow().socket.as_raw_fd();
-        let weak = Rc::downgrade(&client.state);
+        // A strong reference: the registration keeps the connection alive, and closing
+        // removes the registration, which releases it. With only a weak reference, dropping
+        // the last handle would close the socket but leave the registration behind, and
+        // `Reactor::run` would never return.
+        let state = Rc::clone(&client.state);
         let token = reactor.add(fd, Interest::WRITABLE, move |r, _, readiness| {
-            if let Some(state) = weak.upgrade() {
-                Client { state }.on_ready(r, readiness);
+            Client {
+                state: Rc::clone(&state),
             }
+            .on_ready(r, readiness);
         })?;
         client.state.borrow_mut().token = Some(token);
         if let Some(timeout) = options.connect_timeout
@@ -128,7 +181,8 @@ impl Client {
             let timer = reactor.after(timeout, move |r| {
                 if let Some(state) = weak.upgrade() {
                     let c = Client { state };
-                    if c.state.borrow().phase == Phase::Connecting {
+                    let phase = c.state.borrow().phase;
+                    if matches!(phase, Phase::Connecting | Phase::Handshaking) {
                         c.fail(r, Error::new(ErrorKind::TimedOut, "connect timed out"));
                     }
                 }
@@ -186,6 +240,14 @@ impl Client {
         let phase = self.state.borrow().phase;
         match phase {
             Phase::Connecting => self.finish_connect(r),
+            Phase::Handshaking => self.handshake(r),
+            Phase::Connected if self.state.borrow().tls.is_some() => {
+                // Either readiness can unblock either direction: a TLS read may have to
+                // send and a write may have to receive.
+                self.flush(r);
+                self.read(r);
+                self.update_interest(r);
+            }
             Phase::Connected => {
                 if readiness.writable {
                     self.flush(r);
@@ -202,20 +264,52 @@ impl Client {
         let error = self.state.borrow().socket.take_error();
         match error {
             Ok(None) => {
-                let timer = {
+                let started = {
                     let mut s = self.state.borrow_mut();
-                    s.phase = Phase::Connected;
-                    s.connect_timer.take()
+                    let s = &mut *s;
+                    s.tls_pending.take().map(|(tls, name)| {
+                        // SAFETY: the session is stored in `State::tls`, declared (and so
+                        // dropped) before the socket it uses.
+                        let session = unsafe { TlsSession::client(&tls, &name, &s.socket) }?;
+                        s.tls = Some(session);
+                        s.phase = Phase::Handshaking;
+                        Ok(())
+                    })
                 };
-                if let Some(timer) = timer {
-                    r.cancel_timer(timer);
+                match started {
+                    Some(Ok(())) => self.handshake(r),
+                    Some(Err(e)) => self.fail(r, e),
+                    None => self.connected(r),
                 }
-                self.update_interest(r);
-                self.with_handler(r, |h, c, r| h.on_connect(c, r));
-                self.flush(r);
             }
             Ok(Some(err)) | Err(err) => self.fail(r, err.into()),
         }
+    }
+
+    fn handshake(&self, r: &mut Reactor) {
+        let result = match &mut self.state.borrow_mut().tls {
+            Some(session) => session.handshake(),
+            None => Ok(()),
+        };
+        match result {
+            Ok(()) => self.connected(r),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => self.update_interest(r),
+            Err(e) => self.fail(r, io_failure(e)),
+        }
+    }
+
+    fn connected(&self, r: &mut Reactor) {
+        let timer = {
+            let mut s = self.state.borrow_mut();
+            s.phase = Phase::Connected;
+            s.connect_timer.take()
+        };
+        if let Some(timer) = timer {
+            r.cancel_timer(timer);
+        }
+        self.update_interest(r);
+        self.with_handler(r, |h, c, r| h.on_connect(c, r));
+        self.flush(r);
     }
 
     fn read(&self, r: &mut Reactor) {
@@ -225,9 +319,14 @@ impl Client {
         {
             let mut s = self.state.borrow_mut();
             let s = &mut *s;
+            // Reading until the socket would block also drains plaintext OpenSSL holds.
             loop {
                 let socket = &s.socket;
-                match s.input.fill_with(64 * 1024, |space| socket.recv(space)) {
+                let read = match &mut s.tls {
+                    Some(tls) => s.input.fill_with(16 * 1024, |space| tls.read(space)),
+                    None => s.input.fill_with(64 * 1024, |space| socket.recv(space)),
+                };
+                match read {
                     Ok(0) => {
                         eof = true;
                         break;
@@ -235,7 +334,7 @@ impl Client {
                     Ok(_) => {}
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                     Err(e) => {
-                        error = Some(Error::from(e));
+                        error = Some(io_failure(e));
                         break;
                     }
                 }
@@ -272,13 +371,22 @@ impl Client {
     fn update_interest(&self, r: &mut Reactor) {
         let mut s = self.state.borrow_mut();
         let Some(token) = s.token else { return };
-        let mut want = match s.phase {
-            Phase::Connecting => Interest::WRITABLE,
-            Phase::Connected => Interest::READABLE,
-            Phase::Closed => return,
+        let mut want = match (s.phase, &s.tls) {
+            (Phase::Connecting, _) => Interest::WRITABLE,
+            (Phase::Handshaking, Some(tls)) => tls.wants(),
+            (Phase::Handshaking, None) | (Phase::Connected, _) => Interest::READABLE,
+            (Phase::Closed, _) => return,
         };
-        if s.phase == Phase::Connected && !s.output.is_empty() {
-            want = want | Interest::WRITABLE;
+        if s.phase == Phase::Connected {
+            if !s.output.is_empty() {
+                want = want | Interest::WRITABLE;
+            }
+            // A TLS read that has to send.
+            if let Some(tls) = &s.tls
+                && tls.wants() == Interest::WRITABLE
+            {
+                want = want | Interest::WRITABLE;
+            }
         }
         if want != s.interest && r.set_interest(token, want).is_ok() {
             s.interest = want;
@@ -299,8 +407,12 @@ impl Client {
                     continue;
                 }
                 let sent = {
+                    let s = &mut *s;
                     let slices = s.output.io_slices(64);
-                    s.socket.send_vectored(&slices)
+                    match &mut s.tls {
+                        Some(tls) => tls.write_vectored(&slices),
+                        None => s.socket.send_vectored(&slices),
+                    }
                 };
                 match sent {
                     Ok(n) => {
@@ -308,7 +420,7 @@ impl Client {
                     }
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                     Err(e) => {
-                        failed = Some(Error::from(e));
+                        failed = Some(io_failure(e));
                         break;
                     }
                 }
@@ -349,11 +461,13 @@ impl Client {
         if let Some(timer) = timer {
             r.cancel_timer(timer);
         }
-        let _ = self
-            .state
-            .borrow()
-            .socket
-            .shutdown(std::net::Shutdown::Both);
+        {
+            let mut s = self.state.borrow_mut();
+            if let Some(tls) = &mut s.tls {
+                tls.close_notify();
+            }
+            let _ = s.socket.shutdown(std::net::Shutdown::Both);
+        }
         self.notify(r, Note::Close);
     }
 
@@ -391,6 +505,11 @@ impl Client {
 
     pub fn is_closed(&self) -> bool {
         self.state.borrow().phase == Phase::Closed
+    }
+
+    /// What the TLS handshake negotiated, once connected over TLS.
+    pub fn tls_info(&self) -> Option<TlsInfo> {
+        self.state.borrow().tls.as_ref().and_then(TlsSession::info)
     }
 
     pub fn local_address(&self) -> Result<SocketAddress> {
@@ -467,6 +586,40 @@ mod tests {
     }
 
     #[test]
+    fn connection_outlives_dropped_handles() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = SocketAddress::from(listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (s, _) = listener.accept().unwrap();
+            let mut writer = s.try_clone().unwrap();
+            for line in BufReader::new(s).lines() {
+                writer
+                    .write_all(format!("{}\n", line.unwrap().to_uppercase()).as_bytes())
+                    .unwrap();
+            }
+        });
+        let mut reactor = Reactor::new().unwrap();
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let options = ClientOptions {
+            decoder: Some(Box::new(Delimited::new(&b"\n"[..], 1024))),
+            ..ClientOptions::default()
+        };
+        let recorder = Recorder {
+            log: Rc::clone(&log),
+        };
+        let weak = Rc::downgrade(
+            &Client::connect(&mut reactor, &addr, options, recorder)
+                .unwrap()
+                .state,
+        );
+        // No handle is kept: the exchange still completes and `run` returns.
+        reactor.run().unwrap();
+        server.join().unwrap();
+        assert_eq!(*log.borrow(), ["connect", "ONE", "TWO", "close"]);
+        assert!(weak.upgrade().is_none(), "state freed once closed");
+    }
+
+    #[test]
     fn refused_connection_reports_error() {
         let probe = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = SocketAddress::from(probe.local_addr().unwrap());
@@ -491,5 +644,127 @@ mod tests {
                 assert_eq!(*log.borrow(), ["error Io", "close"]);
             }
         }
+    }
+
+    /// A blocking TLS server thread: runs `serve` on the first accepted connection.
+    fn tls_server(
+        pki: &crate::network::tls::test_pki::Pki,
+        serve: impl FnOnce(openssl::ssl::SslStream<std::net::TcpStream>) + Send + 'static,
+    ) -> (SocketAddress, std::thread::JoinHandle<()>) {
+        use openssl::ssl::{SslAcceptor, SslFiletype, SslMethod};
+        let mut acceptor = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls()).unwrap();
+        acceptor
+            .set_private_key_file(&pki.key, SslFiletype::PEM)
+            .unwrap();
+        acceptor.set_certificate_chain_file(&pki.cert).unwrap();
+        let acceptor = acceptor.build();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = SocketAddress::from(listener.local_addr().unwrap());
+        let thread = std::thread::spawn(move || {
+            let (tcp, _) = listener.accept().unwrap();
+            if let Ok(stream) = acceptor.accept(tcp) {
+                serve(stream);
+            }
+        });
+        (addr, thread)
+    }
+
+    fn tls_options(pki: &crate::network::tls::test_pki::Pki) -> ClientOptions {
+        ClientOptions {
+            tls: Some(
+                crate::network::tls::test_pki::client_options(pki)
+                    .build()
+                    .unwrap(),
+            ),
+            ..ClientOptions::default()
+        }
+    }
+
+    #[test]
+    fn tls_exchange_and_bulk_download() {
+        let pki = crate::network::tls::test_pki::generate();
+        let (addr, server) = tls_server(&pki, |stream| {
+            let mut reader = BufReader::new(stream);
+            let mut line = String::new();
+            while reader.read_line(&mut line).unwrap() > 0 {
+                let reply = format!("{}\n", line.trim_end().to_uppercase());
+                reader.get_mut().write_all(reply.as_bytes()).unwrap();
+                line.clear();
+            }
+        });
+        let mut reactor = Reactor::new().unwrap();
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let options = ClientOptions {
+            decoder: Some(Box::new(Delimited::new(&b"\n"[..], 1024))),
+            ..tls_options(&pki)
+        };
+        let recorder = Recorder {
+            log: Rc::clone(&log),
+        };
+        let client = Client::connect(&mut reactor, &addr, options, recorder).unwrap();
+        reactor.run().unwrap();
+        server.join().unwrap();
+        assert_eq!(*log.borrow(), ["connect", "ONE", "TWO", "close"]);
+        assert_eq!(client.tls_info().unwrap().version, "TLSv1.3");
+
+        // Many records, then the server closes.
+        let payload: Vec<u8> = (0..200_000u32).map(|i| (i % 249) as u8).collect();
+        let expected = payload.clone();
+        let (addr, server) = tls_server(&pki, move |mut stream| {
+            stream.write_all(&payload).unwrap();
+            stream.shutdown().unwrap();
+        });
+        struct Collect(Rc<RefCell<(Vec<u8>, bool)>>);
+        impl ClientHandler for Collect {
+            fn on_receive(&mut self, _c: &Client, _r: &mut Reactor, data: Vec<u8>) {
+                self.0.borrow_mut().0.extend_from_slice(&data);
+            }
+            fn on_close(&mut self, _c: &Client, _r: &mut Reactor) {
+                self.0.borrow_mut().1 = true;
+            }
+        }
+        let got = Rc::new(RefCell::new((Vec::new(), false)));
+        let mut reactor = Reactor::new().unwrap();
+        Client::connect(
+            &mut reactor,
+            &addr,
+            tls_options(&pki),
+            Collect(Rc::clone(&got)),
+        )
+        .unwrap();
+        reactor.run().unwrap();
+        server.join().unwrap();
+        let got = got.borrow();
+        assert!(
+            got.0 == expected,
+            "download differs ({} bytes)",
+            got.0.len()
+        );
+        assert!(got.1, "on_close after EOF");
+    }
+
+    #[test]
+    fn tls_rejections() {
+        let pki = crate::network::tls::test_pki::generate();
+        let (addr, server) = tls_server(&pki, |_| {});
+        let mut reactor = Reactor::new().unwrap();
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let options = ClientOptions {
+            server_name: Some("example.test".into()),
+            ..tls_options(&pki)
+        };
+        let recorder = Recorder {
+            log: Rc::clone(&log),
+        };
+        Client::connect(&mut reactor, &addr, options, recorder).unwrap();
+        reactor.run().unwrap();
+        server.join().unwrap();
+        assert_eq!(*log.borrow(), ["error Protocol", "close"]);
+
+        let unix = SocketAddress::unix(pki.dir.join("none.sock"));
+        let err = Client::connect(&mut reactor, &unix, tls_options(&pki), Recorder::default())
+            .err()
+            .unwrap();
+        assert_eq!(err.kind(), ErrorKind::InvalidArgument);
     }
 }
