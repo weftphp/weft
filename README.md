@@ -92,7 +92,7 @@ cargo run --example http     # then: curl http://127.0.0.1:9502/hello
 
 ## Building
 
-Requires stable Rust (edition 2024). Developed on macOS; Linux is the primary target.
+Requires stable Rust (edition 2024) and OpenSSL 3.0 or newer. Linux is the primary target.
 
 ```sh
 cargo build

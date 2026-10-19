@@ -1,5 +1,9 @@
-//! An HTTP server on top of [`Server`]: HTTP/1.1 with keep-alive and pipelining, HTTP/2 over
-//! cleartext (prior knowledge), WebSocket upgrades, and static files.
+//! An HTTP server on top of [`Server`]: HTTP/1.1 with keep-alive and pipelining, HTTP/2,
+//! WebSocket upgrades, and static files.
+//!
+//! HTTP/2 is recognised by its connection preface: in cleartext that is prior knowledge,
+//! and over TLS it follows an ALPN agreement on `h2`. For HTTPS, give listeners a
+//! [`ServerTls`](crate::network::ServerTls) offering `["h2", "http/1.1"]`.
 //!
 //! Applications implement [`HttpApp`]. [`HttpApp::on_request`] may answer at once by
 //! returning a [`Response`], or later through [`HttpContext::respond`] (for example after a
@@ -33,7 +37,8 @@ pub struct HttpOptions {
     pub index_files: Vec<String>,
     /// Accept WebSocket upgrades (each still needs [`HttpApp::on_upgrade`] to agree).
     pub websocket: bool,
-    /// Accept HTTP/2 connections that start with the connection preface.
+    /// Accept HTTP/2 connections that start with the connection preface. When off, TLS
+    /// listeners must not offer `h2` through ALPN.
     pub http2: bool,
     pub max_ws_message: usize,
     /// Value of the `Server` header, if any.
@@ -718,6 +723,15 @@ pub fn server<A: HttpApp>(
 ) -> Result<Server> {
     for listener in &mut config.listeners {
         listener.framing = Framing::Raw;
+        if !options.http2
+            && let Some(tls) = &listener.tls
+            && tls.alpn().iter().any(|p| p == "h2")
+        {
+            return Err(Error::new(
+                ErrorKind::InvalidArgument,
+                "a TLS listener offers h2 through ALPN, but HttpOptions::http2 is off",
+            ));
+        }
     }
     let options = Arc::new(options);
     Server::new(config, move |role| Adapter {
