@@ -1,0 +1,16 @@
+main cid=1
+woke 1
+woke 2
+woke 3
+2,4,6
+caught boom
+20000
+bool(true)
+bool(false)
+ab
+live: 1
+sum=5000
+RuntimeException: escaped
+go() must be called inside Weft\run()
+run() cannot be called from inside a coroutine
+end

@@ -22,8 +22,8 @@ written in Rust** that exposes this engine to PHP userland as weft's own plugin.
 ### Current status
 
 weft is a library crate (`src/lib.rs`) plus a placeholder binary (`src/main.rs`) and runnable
-examples (`examples/`). The Rust engine's layers exist; the PHP extension does not yet. Each
-module's `mod.rs` documents its contents:
+examples (`examples/`). The PHP extension lives in `ext/` (see below). Each engine module's
+`mod.rs` documents its contents:
 
 - `src/core/` — error type, logger, timer, read buffer (`ByteBuffer`), write queue
   (`WriteQueue`), byte-message channels, base64, crc32, sha1, OS randomness.
@@ -43,6 +43,25 @@ module's `mod.rs` documents its contents:
 - `src/server/` — multi-worker server (process or thread mode), task workers, HTTP server.
   Stream listeners can serve TLS; the HTTP server does HTTP/2 over TLS through ALPN.
 
+### PHP extension (`ext/`)
+
+A separate crate (`weft-php`, its own `[workspace]`, so root `cargo` commands ignore it) that
+builds `weft.so`. `ext/README.md` documents building, loading and the PHP API.
+
+- `ext/shim/shim.c` is the only C: Zend macros, runtime function/class tables, and the swap of
+  executor state between coroutines. Everything else is Rust.
+- `ext/src/php.rs` wraps the shim; `vm.rs` installs the coroutine switch hook that swaps each
+  coroutine's VM stack; `coro.rs`, `sync.rs`, `timer.rs`, `socket.rs`, `http.rs` register the
+  PHP-visible API (namespace `Weft\`).
+- Every PHP-callable handler is declared with `handler!`, which turns errors and panics into
+  `Weft\Exception` so nothing unwinds across the FFI boundary.
+- The HTTP server forks workers (process mode only); each request runs in its own coroutine and
+  answers through `server::http::Responder`, so handlers may suspend.
+
+Tests: `cd ext && cargo build && tests/run.sh [debug|release]` runs `tests/php/*.php` against
+the built extension and diffs against the `.expect` files. Also run `cargo fmt` and
+`cargo clippy -- -D warnings` inside `ext/`.
+
 Not implemented: DTLS, TLS in the blocking framed client (`network::stream`), kernel TLS
 offload (TLS file responses are copied, not `sendfile`d), and an io_uring backend.
 
@@ -56,17 +75,18 @@ needs OpenSSL **3.0 or newer** (it relies on `SSL_OP_IGNORE_UNEXPECTED_EOF`); th
 
 Decided so far:
 
+- PHP bindings: hand-written Zend API glue (a small C shim plus Rust), not `ext-php-rs`.
+- PHP support: 8.4, non-thread-safe (NTS) builds only; the shim refuses ZTS at compile time.
+- PHP API: weft's own `Weft\` namespace design, not a copy of another project's names.
+- Layout: the extension is the separate crate in `ext/`; the engine stays a plain library.
 - Async runtime: weft has its own reactor (epoll / kqueue / poll) and stackful coroutines;
   it does not build on tokio.
 - TLS: OpenSSL, through the `openssl` crate (not rustls).
 
 Open decisions (do **not** settle these unilaterally — ask the user):
 
-- How PHP bindings are built (e.g. `ext-php-rs` vs. hand-written Zend API FFI), which PHP versions
-  are supported, and whether ZTS builds are supported.
-- Whether the PHP-facing API mirrors the reference implementation's (`go()`, server classes, …) or
-  is weft's own design.
-- Crate/workspace layout (single crate vs. Cargo workspace split into core / net / http / etc.).
+- Whether to support more PHP versions (8.1–8.3) or ZTS builds.
+- Whether to split the engine into a Cargo workspace (core / net / http / etc.).
 
 ## Reference source
 

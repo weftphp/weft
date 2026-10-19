@@ -25,7 +25,7 @@ mod worker;
 pub use config::{Config, Framing, Listener, Mode, Transport};
 pub use ipc::TaskId;
 pub use task::TaskContext;
-pub use worker::Context;
+pub use worker::{Context, wake as wake_worker};
 
 use std::fmt;
 use std::sync::Arc;
@@ -118,6 +118,8 @@ pub trait Handler: 'static {
     fn on_pipe_message(&mut self, ctx: &mut Context<'_>, from: usize, data: Vec<u8>) {}
     /// A task submitted by this worker finished with `result`.
     fn on_finish(&mut self, ctx: &mut Context<'_>, task: TaskId, result: Vec<u8>) {}
+    /// [`wake_worker`] was called on this worker.
+    fn on_wake(&mut self, ctx: &mut Context<'_>) {}
     /// The worker is stopping; connections get `stop_grace` to finish.
     fn on_worker_stop(&mut self, ctx: &mut Context<'_>) {}
     /// Runs in a task worker. Returning `Some` sends the result back to the submitter.
