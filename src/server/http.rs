@@ -9,8 +9,10 @@
 //! returning a [`Response`], or later through [`HttpContext::respond`] (for example after a
 //! task or timer); HTTP/1.1 responses still go out in request order.
 
+use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::SystemTime;
 
@@ -145,18 +147,50 @@ enum Proto {
     Http2(Box<ServerSession>),
 }
 
+type Outbox = Rc<RefCell<Vec<(RequestId, Response)>>>;
+
+/// Answers requests from outside the [`HttpApp`] callbacks, for example from a coroutine
+/// that finished after `on_request` returned `None`. Clones share one queue; it only works
+/// on the worker thread that created it.
+#[derive(Clone)]
+pub struct Responder {
+    outbox: Outbox,
+}
+
+impl Responder {
+    /// Queues `response` for request `id` and wakes the worker to send it. `reactor` is the
+    /// worker's event loop (for a coroutine, [`with_reactor`](crate::coroutine::with_reactor)).
+    pub fn respond(
+        &self,
+        reactor: &mut crate::reactor::Reactor,
+        id: RequestId,
+        response: Response,
+    ) {
+        self.outbox.borrow_mut().push((id, response));
+        super::wake_worker(reactor);
+    }
+}
+
 /// What [`HttpApp`] callbacks can do.
 pub struct HttpContext<'c, 'a> {
     ctx: &'c mut Context<'a>,
     conns: &'c mut HashMap<ConnId, Proto>,
     deferred: &'c mut Vec<(RequestId, Response)>,
     options: &'c HttpOptions,
+    outbox: &'c Outbox,
 }
 
 impl<'c, 'a> HttpContext<'c, 'a> {
     /// The underlying server context (tasks, timers, raw sends, worker info).
     pub fn server(&mut self) -> &mut Context<'a> {
         self.ctx
+    }
+
+    /// A handle for answering requests later, from outside this callback.
+    pub fn responder(&self) -> Responder {
+        Responder {
+            outbox: Rc::clone(self.outbox),
+        }
     }
 
     /// Answers request `id` that [`HttpApp::on_request`] left pending.
@@ -315,6 +349,7 @@ struct Adapter<A> {
     app: A,
     conns: HashMap<ConnId, Proto>,
     deferred: Vec<(RequestId, Response)>,
+    outbox: Outbox,
     options: Arc<HttpOptions>,
 }
 
@@ -341,12 +376,14 @@ impl<A: HttpApp> Adapter<A> {
             conns: &mut self.conns,
             deferred: &mut self.deferred,
             options: &self.options,
+            outbox: &self.outbox,
         };
         f(&mut self.app, &mut hctx)
     }
 
     fn apply_deferred(&mut self, ctx: &mut Context<'_>) {
-        for (id, response) in std::mem::take(&mut self.deferred) {
+        let queued = std::mem::take(&mut *self.outbox.borrow_mut());
+        for (id, response) in std::mem::take(&mut self.deferred).into_iter().chain(queued) {
             let _ = deliver(ctx, &mut self.conns, &self.options, id, response);
         }
     }
@@ -673,6 +710,10 @@ impl<A: HttpApp> Handler for Adapter<A> {
         self.apply_deferred(ctx);
     }
 
+    fn on_wake(&mut self, ctx: &mut Context<'_>) {
+        self.apply_deferred(ctx);
+    }
+
     fn on_connect(&mut self, _ctx: &mut Context<'_>, conn: ConnId) {
         let proto = self.new_http1();
         self.conns.insert(conn, proto);
@@ -738,6 +779,7 @@ pub fn server<A: HttpApp>(
         app: factory(role),
         conns: HashMap::new(),
         deferred: Vec::new(),
+        outbox: Rc::new(RefCell::new(Vec::new())),
         options: Arc::clone(&options),
     })
 }

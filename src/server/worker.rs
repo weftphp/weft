@@ -82,6 +82,7 @@ pub(crate) enum Event {
         data: Vec<u8>,
     },
     Timer(TimerFn),
+    Wake,
     Stop,
 }
 
@@ -554,6 +555,14 @@ fn with_core(r: &mut Reactor, f: impl FnOnce(&mut Core, &mut Reactor)) {
     pump(&shared, r);
 }
 
+/// Asks this thread's worker to call [`Handler::on_wake`] soon. Safe to call from anywhere
+/// on the worker's thread, including from a coroutine; it does nothing outside a worker.
+pub fn wake(r: &mut Reactor) {
+    r.defer(|r| {
+        with_core(r, |core, _| core.events.push_back(Event::Wake));
+    });
+}
+
 /// Delivers an envelope posted from another thread to this thread's worker.
 pub(crate) fn deliver_local(r: &mut Reactor, envelope: Envelope) {
     with_core(r, |core, r| core.handle_envelope(r, envelope));
@@ -590,6 +599,7 @@ fn pump(shared: &Rc<Shared>, r: &mut Reactor) {
                 Event::PipeMessage { from, data } => handler.on_pipe_message(&mut ctx, from, data),
                 Event::TaskResult { task, data } => handler.on_finish(&mut ctx, task, data),
                 Event::Timer(f) => f(&mut ctx),
+                Event::Wake => handler.on_wake(&mut ctx),
                 Event::Stop => handler.on_worker_stop(&mut ctx),
             }
         }

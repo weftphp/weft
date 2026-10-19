@@ -1,0 +1,9 @@
+PING
+PONG
+bool(true)
+the socket is closed
+200 OK hello b
+refused
+echoed 60/60
+accept stopped
+end

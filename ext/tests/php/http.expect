@@ -1,0 +1,5 @@
+200 application/json {"method":"POST","query":{"a":"1","b":"two"},"body":"hello","header":"yes","cookies":{"k":"v"}}
+404 not found
+500
+202 from another coroutine
+slow ok=6 overlapped=true
