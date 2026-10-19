@@ -3,11 +3,11 @@
 An asynchronous, coroutine-based engine for PHP.
 
 weft brings an event loop, coroutines, timers, and multi-process TCP/UDP/HTTP/WebSocket servers
-to PHP. The goal is a **standalone PHP extension**: PHP code gets coroutine-based concurrency, backed
-by a fast, memory-safe native engine.
+to PHP. It ships as a **standalone PHP extension** (PHP 8.4): PHP code gets coroutine-based concurrency,
+backed by a fast, memory-safe native engine.
 
-> **Status: early development.** The engine is in place; the PHP extension does not exist
-> yet. APIs will change.
+> **Status: early development.** The engine and a first PHP extension are in place. APIs will
+> change.
 
 ## Roadmap
 
@@ -17,9 +17,11 @@ by a fast, memory-safe native engine.
    - [x] `coroutine`: stackful coroutines, scheduler, coroutine sockets and clients
    - [x] `network`, `protocol`: sockets, DNS, HTTP/1.1, HTTP/2, WebSocket, Redis, MQTT, SOCKS5
    - [x] `server`: process and thread worker models, task workers, HTTP server
-   - [ ] TLS (needs a crypto library; not yet chosen)
+   - [x] TLS: OpenSSL-backed clients and servers, HTTPS and HTTP/2 over ALPN
    - [ ] io_uring backend (Linux)
-2. **PHP extension:** expose the engine to PHP userland as a loadable extension.
+2. **PHP extension** ([ext/](ext/)): expose the engine to PHP userland as a loadable extension.
+   - [x] coroutines, channels, mutex, wait group, timers, TCP sockets, HTTP client, HTTP/HTTPS server
+   - [ ] the rest of the engine (UDP, WebSocket, Redis, MQTT, tasks, shared memory)
 
 ## What's inside
 
@@ -30,13 +32,13 @@ by a fast, memory-safe native engine.
 | `reactor`   | Single-threaded event loop: I/O readiness, timers, deferred tasks, cross-thread posts, signals; epoll, kqueue and `poll(2)` backends |
 | `global`    | Per-thread event loop behind plain functions (`timer::after`, `event::add`, `event::wait`) |
 | `coroutine` | Stackful coroutines with a hand-written context switch (aarch64, x86_64), channels, mutex, wait group, coroutine sockets, HTTP/WebSocket client, DNS, `exec`, file I/O on helper threads |
-| `network`   | Socket addresses, a non-blocking socket with full option control, DNS (hosts, resolv.conf, wire format), callback client, blocking framed client |
+| `network`   | Socket addresses, a non-blocking socket with full option control, DNS (hosts, resolv.conf, wire format), callback client, blocking framed client, TLS (OpenSSL) |
 | `protocol`  | Framing (length-prefixed, delimited), HTTP/1.x parser with smuggling defenses, multipart, cookies, HTTP/2 frames + HPACK + server session, WebSocket, Redis RESP2/3, MQTT 3.1.1, SOCKS5, MIME types |
 | `lock`      | Cross-process locks in shared memory: robust mutex, spinlock, rwlock, barrier |
 | `memory`    | Shared mappings, a shared hash table with typed columns, a shared message queue, a block pool |
-| `server`    | Multi-worker server: process or thread mode, listeners with framing, task workers, inter-worker messages, idle timeouts, graceful reload, HTTP/1.1 + HTTP/2 + WebSocket + static files |
+| `server`    | Multi-worker server: process or thread mode, listeners with framing, task workers, inter-worker messages, idle timeouts, graceful reload, HTTP/1.1 + HTTP/2 + WebSocket + static files, optional TLS |
 
-The only dependency is `libc`.
+Dependencies: `libc` and `openssl`.
 
 ## Examples
 
@@ -46,10 +48,32 @@ Runnable examples live in [examples/](examples/):
 - `http`: an HTTP server with four supervised worker processes, answering HTTP/1.1 and HTTP/2 on
   port 9502 (try it with `curl http://127.0.0.1:9502/hello`).
 
+## PHP extension
+
+```php
+use function Weft\{run, go, sleep};
+
+run(function () {
+    go(function () { sleep(0.1); echo "second\n"; });
+    echo "first\n";
+});
+```
+
+See [ext/README.md](ext/README.md) for the full API.
+
 ## Building
 
-Requires OpenSSL 3.0 or newer. Linux is the primary target. See [AGENTS.md](AGENTS.md) for the
-build, test and lint commands.
+Requires a Rust toolchain and OpenSSL 3.0 or newer; the extension also needs PHP 8.4 headers
+(`php-config`). Linux is the primary target; macOS works too.
+
+```sh
+make                 # build the extension -> ext/target/release/weft.so
+make test            # engine tests, then the extension tests
+make install         # copy weft.so into PHP's extension dir
+make check           # fmt + clippy
+```
+
+See [AGENTS.md](AGENTS.md) for more on build, test and lint commands.
 
 ## Contributing
 
